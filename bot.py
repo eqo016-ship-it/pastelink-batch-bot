@@ -30,6 +30,8 @@ ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "").strip()
 PORT = int((os.getenv("PORT") or "8080").strip())
 DEFAULT_PRIMARY_DOMAIN = (os.getenv("DEFAULT_PRIMARY_DOMAIN") or "vixoly.de").strip()
 DEFAULT_BACKUP_DOMAIN = (os.getenv("DEFAULT_BACKUP_DOMAIN") or "vidvsy.de").strip()
+TRACKER_CHAT_ID_RAW = (os.getenv("TRACKER_CHAT_ID") or "").strip()
+TRACKER_SEND_DELAY_SEC = int((os.getenv("TRACKER_SEND_DELAY_SEC") or "5").strip())
 
 ADMIN_IDS: set[int] = set()
 if ADMIN_IDS_RAW:
@@ -44,8 +46,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+TRACKER_CHAT_ID: int | None = None
+if TRACKER_CHAT_ID_RAW:
+    try:
+        TRACKER_CHAT_ID = int(TRACKER_CHAT_ID_RAW)
+    except ValueError:
+        logger.warning("TRACKER_CHAT_ID tidak valid: %s", TRACKER_CHAT_ID_RAW)
+
 VIDOY_LINK_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?([^\s/]+)/(f|d|e)/([a-zA-Z0-9_-]+)",
+    r"(?:https?://)?(?:www\.)?([^\s/]+)/(f|d|e)/([^\s/?#]+)",
     re.IGNORECASE,
 )
 BACKUP_HINT_PATTERN = re.compile(r"(backup|alternatif)", re.IGNORECASE)
@@ -53,6 +62,8 @@ PRIMARY_SECTION_HINT_PATTERN = re.compile(
     r"(video|utama|bonus|asupan|join|konten|judul)",
     re.IGNORECASE,
 )
+VIDEO_HINT_PATTERN = re.compile(r"(video|utama)", re.IGNORECASE)
+BONUS_HINT_PATTERN = re.compile(r"(bonus)", re.IGNORECASE)
 
 
 def _normalize_domain(domain: str) -> str:
@@ -113,13 +124,15 @@ def _replace_vidoy_domains_by_context(
     primary_domain: str,
     backup_domain: str,
     old_domain: str | None = None,
-) -> tuple[str, list[tuple[str, str]], int, int]:
+) -> tuple[str, list[tuple[str, str]], int, int, dict[str, int]]:
     lines = (body or "").splitlines()
     out_lines: list[str] = []
     changed_pairs: list[tuple[str, str]] = []
     changed_primary = 0
     changed_backup = 0
+    category_counts: dict[str, int] = {"video": 0, "bonus": 0, "backup": 0, "biasa": 0}
     in_backup_block = False
+    last_section = "biasa"
 
     for raw in lines:
         line = raw
@@ -131,8 +144,16 @@ def _replace_vidoy_domains_by_context(
 
         if BACKUP_HINT_PATTERN.search(trimmed):
             in_backup_block = True
+            last_section = "backup"
             out_lines.append(line)
             continue
+
+        if BONUS_HINT_PATTERN.search(trimmed):
+            last_section = "bonus"
+            in_backup_block = False
+        elif VIDEO_HINT_PATTERN.search(trimmed):
+            last_section = "video"
+            in_backup_block = False
 
         if PRIMARY_SECTION_HINT_PATTERN.search(trimmed):
             in_backup_block = False
@@ -141,16 +162,20 @@ def _replace_vidoy_domains_by_context(
             target = backup_domain if in_backup_block else primary_domain
             new_line, pairs = _replace_line_with_domain(line, target, old_domain)
             if pairs:
+                category = "backup" if in_backup_block else last_section
+                if category not in category_counts:
+                    category = "biasa"
                 if in_backup_block:
                     changed_backup += len(pairs)
                 else:
                     changed_primary += len(pairs)
+                category_counts[category] += len(pairs)
                 changed_pairs.extend(pairs)
             out_lines.append(new_line)
         else:
             out_lines.append(line)
 
-    return "\n".join(out_lines), changed_pairs, changed_primary, changed_backup
+    return "\n".join(out_lines), changed_pairs, changed_primary, changed_backup, category_counts
 
 
 def _extract_vidoy_links(text: str) -> list[str]:
@@ -327,6 +352,90 @@ def _progress_bar(current: int, total: int, width: int = 20) -> str:
     return f"[{bar}] {int(ratio * 100)}%"
 
 
+def _build_tracker_message(
+    pastelink_url: str,
+    note_index: int,
+    total_notes: int,
+    changed_count: int,
+    cnt_primary: int,
+    cnt_backup: int,
+    pairs: list[tuple[str, str]],
+    had_any_link: bool,
+    applied_ok: bool | None,
+    category_counts: dict[str, int],
+) -> str:
+    status_note: str
+    if not had_any_link:
+        status_note = "Status note: ❌ tidak ada link /e|/d|/f yang cocok"
+    elif changed_count <= 0:
+        status_note = "Status note: ⚠️ ada link tapi tidak perlu diubah (sudah sesuai)"
+    else:
+        if applied_ok is None:
+            status_note = "Status note: ✅ perubahan terdeteksi (DRY-RUN, belum disimpan)"
+        elif applied_ok:
+            status_note = "Status note: ✅ perubahan BERHASIL disimpan"
+        else:
+            status_note = "Status note: ❌ perubahan GAGAL disimpan (cek log API Pastelink)"
+
+    lines: list[str] = [
+        f"📌 Pastelink url : {pastelink_url}",
+        f"➡️ Note ke {note_index} dari {total_notes}",
+        "",
+        status_note,
+    ]
+
+    if not had_any_link:
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "",
+            f"Terdeteksi total {changed_count} link berubah",
+            f"• Link utama   : {cnt_primary}",
+            f"• Link backup  : {cnt_backup}",
+            (
+                "• Kategori     : "
+                f"video={category_counts.get('video', 0)}, "
+                f"bonus={category_counts.get('bonus', 0)}, "
+                f"backup={category_counts.get('backup', 0)}, "
+                f"biasa={category_counts.get('biasa', 0)}"
+            ),
+        ]
+    )
+
+    if not pairs:
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("Rincian perubahan (maks 10 baris):")
+
+    for idx, (src, dst) in enumerate(pairs[:10], start=1):
+        lines.append(f"{idx}.")
+        lines.append(f"   dari : {src}")
+        lines.append(f"   ke   : {dst}")
+
+    if len(pairs) > 10:
+        lines.append(f"... dan {len(pairs) - 10} perubahan lainnya.")
+
+    return "\n".join(lines)
+
+
+async def _send_tracker_message(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if not TRACKER_CHAT_ID:
+        return
+    lock = context.application.bot_data.setdefault("tracker_lock", asyncio.Lock())
+    async with lock:
+        try:
+            await context.bot.send_message(
+                chat_id=TRACKER_CHAT_ID,
+                text=text[:3800],
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning("Gagal kirim tracker message: %s", e)
+        await asyncio.sleep(max(1, TRACKER_SEND_DELAY_SEC))
+
+
 def _scan_total_target_links(limit: int) -> tuple[int, int, str | None]:
     urls, err = _list_paste_urls(limit if limit > 0 else 5000)
     if err:
@@ -347,7 +456,7 @@ async def cmd_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = {
         "primary_domain": DEFAULT_PRIMARY_DOMAIN,
         "backup_domain": DEFAULT_BACKUP_DOMAIN,
-        "limit": 50,
+        "limit": 0,
         "awaiting": None,
     }
     context.user_data["change_state"] = state
@@ -597,7 +706,8 @@ async def _run_replace(update: Update, old_domain: str | None, new_domain: str, 
 
 async def _run_replace_contextual(update: Update, context: ContextTypes.DEFAULT_TYPE, do_apply: bool):
     state = context.user_data.get("change_state") or {}
-    limit = int(state.get("limit") or 50)
+    raw_limit = state.get("limit")
+    limit = 0 if raw_limit in (0, "0") else int(raw_limit or 50)
     primary_domain = _normalize_domain(state.get("primary_domain") or DEFAULT_PRIMARY_DOMAIN)
     backup_domain = _normalize_domain(state.get("backup_domain") or DEFAULT_BACKUP_DOMAIN)
     urls, err = _list_paste_urls(limit if limit > 0 else 5000)
@@ -620,6 +730,17 @@ async def _run_replace_contextual(update: Update, context: ContextTypes.DEFAULT_
         primary_domain,
         backup_domain,
     )
+    if TRACKER_CHAT_ID:
+        await _send_tracker_message(
+            context,
+            (
+                "🚀 Mulai tracking perubahan domain\n"
+                f"Total note target: {len(urls)}\n"
+                f"Mode: {'APPLY' if do_apply else 'DRY-RUN'}\n"
+                f"Primary: {primary_domain}\n"
+                f"Backup: {backup_domain}"
+            ),
+        )
 
     changed_notes = 0
     changed_primary = 0
@@ -634,42 +755,51 @@ async def _run_replace_contextual(update: Update, context: ContextTypes.DEFAULT_
             failed += 1
             continue
         body = str(detail.get("body") or "")
-        new_body, pairs, cnt_primary, cnt_backup = _replace_vidoy_domains_by_context(
+        new_body, pairs, cnt_primary, cnt_backup, category_counts = _replace_vidoy_domains_by_context(
             body=body,
             primary_domain=primary_domain,
             backup_domain=backup_domain,
             old_domain=None,
         )
-        if not pairs:
-            if i % 25 == 0 and chat_id and msg_id:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=(
-                        f"⏳ Scan {i}/{len(urls)}\n"
-                        f"Note berubah: {changed_notes}\n"
-                        f"Utama berubah: {changed_primary}\n"
-                        f"Backup berubah: {changed_backup}\n"
-                        f"Applied: {applied}\nFailed: {failed}"
-                    ),
-                    disable_web_page_preview=True,
+        had_any_link = bool(VIDOY_LINK_PATTERN.search(body))
+        note_applied_ok: bool | None = None
+
+        if pairs:
+            changed_notes += 1
+            changed_primary += cnt_primary
+            changed_backup += cnt_backup
+
+            if do_apply:
+                er = _api_call(
+                    "edit-paste",
+                    {"api_key": PASTELINK_API_KEY, "url": pu, "body": new_body},
+                    method="POST",
                 )
-            continue
+                if er.get("response_code") == 200:
+                    applied += 1
+                    note_applied_ok = True
+                else:
+                    failed += 1
+                    note_applied_ok = False
+        else:
+            if do_apply and had_any_link:
+                note_applied_ok = False
 
-        changed_notes += 1
-        changed_primary += cnt_primary
-        changed_backup += cnt_backup
-
-        if do_apply:
-            er = _api_call(
-                "edit-paste",
-                {"api_key": PASTELINK_API_KEY, "url": pu, "body": new_body},
-                method="POST",
-            )
-            if er.get("response_code") == 200:
-                applied += 1
-            else:
-                failed += 1
+        await _send_tracker_message(
+            context,
+            _build_tracker_message(
+                pastelink_url=f"https://pastelink.net/{pu}",
+                note_index=i,
+                total_notes=len(urls),
+                changed_count=len(pairs),
+                cnt_primary=cnt_primary,
+                cnt_backup=cnt_backup,
+                pairs=pairs,
+                had_any_link=had_any_link,
+                applied_ok=note_applied_ok,
+                category_counts=category_counts,
+            ),
+        )
 
         if not sample_done and chat_id and msg_id:
             sample_before = body[:700]
@@ -738,6 +868,19 @@ async def _run_replace_contextual(update: Update, context: ContextTypes.DEFAULT_
         applied,
         failed,
     )
+    if TRACKER_CHAT_ID:
+        await _send_tracker_message(
+            context,
+            (
+                "✅ Tracking selesai\n"
+                f"Scanned note: {len(urls)}\n"
+                f"Note berubah: {changed_notes}\n"
+                f"Link utama berubah: {changed_primary}\n"
+                f"Link backup berubah: {changed_backup}\n"
+                f"Applied note: {applied}\n"
+                f"Failed: {failed}"
+            ),
+        )
 
 
 async def cmd_replace_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
