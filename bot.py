@@ -45,7 +45,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 VIDOY_LINK_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?([^\s/]+)/(f|d|e)/([a-zA-Z0-9_-]+)",
+    r"(?:https?://)?(?:www\.)?([^\s/]+)/(f|d|e)/([^\s/?#]+)",
     re.IGNORECASE,
 )
 BACKUP_HINT_PATTERN = re.compile(r"(backup|alternatif)", re.IGNORECASE)
@@ -347,7 +347,7 @@ async def cmd_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = {
         "primary_domain": DEFAULT_PRIMARY_DOMAIN,
         "backup_domain": DEFAULT_BACKUP_DOMAIN,
-        "limit": 50,
+        "limit": 0,
         "awaiting": None,
     }
     context.user_data["change_state"] = state
